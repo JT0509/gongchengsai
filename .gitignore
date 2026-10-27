@@ -1,0 +1,43 @@
+# ===== 构建产物（不入库）=====
+/build/
+/Obj/
+/bin/
+/out/
+*.o
+*.d
+*.crf
+*.dep
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.lnp
+*.sct
+*.htm
+*.build_log.htm
+
+# ===== Keil 个人窗口布局（含用户名 / 本机路径）=====
+*.uvguix.*
+
+# ===== 调试配置副本（内容与 Libraries 重复，3.6MB）=====
+/DebugConfig/
+
+# ===== EIDE 缓存里的 ARM 参考器件（CA5/CA7/CA9… 本项目不用，2MB）=====
+# 只保留 .cmsis/include（eide.yml 的 includePaths 引用了它）
+/.cmsis/device/
+
+# ===== IDE 缓存 =====
+/.vscode/launch.json
+/.eide/log
+/.eide.usr.ctx.json
+/.settings
+
+# ===== EIDE 模板 =====
+*.ept
+*.eide-template
+
+# ===== 系统文件 =====
+Thumbs.db
+.DS_Store
+desktop.ini
