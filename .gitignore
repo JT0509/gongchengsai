@@ -27,8 +27,11 @@
 # 只保留 .cmsis/include（eide.yml 的 includePaths 引用了它）
 /.cmsis/device/
 
-# ===== IDE 缓存 =====
+# ===== IDE 缓存 / 日志 =====
 /.vscode/launch.json
+/.vscode/*.log
+/.vscode/*.log.lock
+/.vscode/*.lock
 /.eide/log
 /.eide.usr.ctx.json
 /.settings
