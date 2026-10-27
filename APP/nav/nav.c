@@ -29,6 +29,19 @@ volatile int16_t  DBG_NAV_TURN_POS      = 0;
 volatile uint8_t  DBG_NAV_SERVO         = 0; // 夹爪状态：0=张开 1=夹住
 volatile uint8_t  DBG_NAV_COLOR         = 0;
 volatile uint8_t  DBG_NAV_BACK_REASON   = 0;
+volatile uint16_t DBG_NAV_BACK_SIG_GAP   = 0;
+// 转向留档：每次 Nav_Turn_To 记一次，用来区分「指令角度就不对」和「执行不到位」
+volatile uint8_t  DBG_NAV_HEAD_BEFORE   = 0; // 转向前的 sg_heading
+volatile uint8_t  DBG_NAV_TURN_TGT      = 0; // 本次目标角
+volatile int16_t  DBG_NAV_TURN_DEG      = 0; // 本次实际下发的带符号转角
+volatile uint16_t DBG_NAV_TURN_MS       = 0; // 本次旋转延时 ms
+
+// 整局所有转向的流水（单变量只看得到最后一次，整局会被覆盖）
+//   d = TGT − HEAD（按最短路径归一化）；MS 是下发的旋转延时
+volatile uint8_t  NAV_TURN_LOG_NUM = 0;
+volatile uint8_t  NAV_TURN_LOG_HEAD[NAV_TURN_LOG_N] = {0};
+volatile uint8_t  NAV_TURN_LOG_TGT[NAV_TURN_LOG_N]  = {0};
+volatile uint16_t NAV_TURN_LOG_MS[NAV_TURN_LOG_N]   = {0};
 volatile uint8_t  DBG_NAV_PLACE_REASON  = 0;
 
 // ==================== 黑匣子（无串口/免跟车调试） ====================
@@ -117,10 +130,6 @@ static uint8_t  sg_tgt_long     = 0u;
 static uint16_t sg_tgt_last     = 0u;
 static uint16_t sg_tgt_min_gap  = NAV_TARGET_MIN_GAP; // 长间隔线门槛（靶位/回家各一套）
 
-// 回圆心：签名（斜线）只武装，继续倒退到圆心主轴线才停，见 nav.h NAV_BACK_CENTER_GRACE
-static uint8_t  sg_back_armed   = 0u;
-static uint16_t sg_back_last    = 0u;
-
 // 前灰度判靶位状态机：arm(先看到线) → 数"靶位特征"脉冲
 static uint8_t  sg_fr_armed  = 0u;  // 1=已武装，可以开始数特征
 static uint8_t  sg_fr_clear  = 0u;  // 连续看到线（pos>=0）的拍数
@@ -170,6 +179,50 @@ static void Nav_LogTick(void)
     NAV_LOG_I = (uint8_t)((i + 1u) % NAV_LOG_N);
 }
 
+// ============================================================================
+// 相位迁移黑匣子（2026-10-27 加）
+//   Nav_LogTick 只留最近 128 拍（≈1.3s），整局查不了；这里每次**进入新相位**
+//   记一条，一局最多几十条，跑完 attach 就能看完整流程：
+//   哪一步跳去了哪里、当时的朝向估计 sg_heading 是多少、目标角是多少。
+//   典型用途：查「明明该去 A，为什么直接回家了」——如果是 PATH_TURN_TO_HOME，
+//   说明 Nav_Plan_Pick 返回了 0（账本认为三块都取完了），账本错了。
+//   纯记录，不参与任何控制。
+// ============================================================================
+volatile uint8_t NAV_TRC_NUM = 0;
+volatile uint8_t NAV_TRC_PHASE[NAV_TRC_N] = {0};
+volatile uint8_t NAV_TRC_HEAD[NAV_TRC_N]  = {0};
+volatile uint8_t NAV_TRC_AIM[NAV_TRC_N]   = {0};
+volatile uint8_t NAV_TRC_LED[NAV_TRC_N]   = {0};
+
+static uint8_t sg_trc_last = 0xFFu;   // 上一次记录的相位（Nav_Task2_Start 复位）
+
+static void Nav_TrcPhase(void)
+{
+    uint8_t p = (uint8_t)nav_phase;
+
+    if (p == sg_trc_last) return;
+    sg_trc_last = p;
+
+    if (NAV_TRC_NUM < NAV_TRC_N)
+    {
+        uint8_t i = NAV_TRC_NUM;
+        NAV_TRC_PHASE[i] = p;
+        NAV_TRC_HEAD[i]  = (uint8_t)sg_heading;
+        // 本相位的目标角：去点取料/去靶位用 pick_angle，转靶位用 target_angle
+        NAV_TRC_AIM[i]   = (p == PATH_TURN_TO_TARGET)
+                           ? (uint8_t)sg_target_angle
+                           : (uint8_t)sg_pick_angle;
+        NAV_TRC_LED[i]   = (uint8_t)((sg_picked & 0x03u)
+                           | (sg_taken[0] ? 0x04u : 0u)
+                           | (sg_taken[1] ? 0x08u : 0u)
+                           | (sg_taken[2] ? 0x10u : 0u)
+                           | ((sg_stage[0] != 0u) ? 0x20u : 0u)
+                           | ((sg_stage[1] != 0u) ? 0x40u : 0u)
+                           | ((sg_claw     != 0u) ? 0x80u : 0u));
+        NAV_TRC_NUM++;
+    }
+}
+
 static void Nav_StopSnap(void)
 {
     NAV_STOP_SNAPPED = 1;
@@ -199,8 +252,6 @@ static void Nav_Counter_Init(uint8_t count_foot)
     sg_prev_gap   = 0;
     sg_max_gap    = 0;
     sg_line_count = 0;
-    sg_back_armed = 0u;  // 新的一段开始，"已过斜线"标志必须清
-    sg_back_last  = 0u;
 
     if (black_now && count_foot)
     {
@@ -358,10 +409,26 @@ static uint8_t Nav_Center_Check(void)
 }
 
 // ============================================================================
-// 任意角带符号转向（开环）：角度 = 0.14°/ms × (t − 350ms)
+// 任意角带符号转向（开环）：角度 = k × (t − T0)，线性模型不变
 //   deg > 0 右转（顺时针，φ 增大）；deg < 0 左转（逆时针）
-//   正方向（45/90/135/180）已在实车五色投料中验证过，这里只补负方向。
+//
+// ★2026-10-27 用三次导航实跑数据重新拟合参数（逻辑没动，只改 T0 / RATE）：
+//     546ms → 45°
+//     741ms → 72.5°   (RATE=23)
+//     1409ms → 137.5° (RATE=17，差40多度)
+//   最小二乘 → k ≈ 0.1045°/ms、起步死区 t0 ≈ 65ms
+//   ⚠ 关键：原来的 T0=350 是拿「标定程序」数据标的，标定时车没停稳，
+//     把一部分纯旋转算成了死区。导航里 SETTLE=600ms 完全静止后，
+//     真正的死区只有 ~65ms。所以 T0 必须一起降，只调 RATE 永远对不上。
+//   新参数 T0=50 / RATE=10 的预测：45°→45°、90°→92°、135°→139°、180°→186°
 // ============================================================================
+// 转向时长：ms = t0 + |deg| × 100 / rate
+static uint32_t Nav_Spin_Ms(uint16_t a, uint16_t t0, uint16_t rate)
+{
+    if (rate == 0u) rate = 1u;
+    return (uint32_t)t0 + (uint32_t)a * 100u / (uint32_t)rate;
+}
+
 static void Nav_SpinDeg(int16_t deg)
 {
     uint32_t ms;
@@ -370,11 +437,55 @@ static void Nav_SpinDeg(int16_t deg)
     if (deg == 0) return;
 
     a  = (uint16_t)((deg > 0) ? deg : -deg);
-    ms = (uint32_t)NAV_TURN_T0_MS +
-         (uint32_t)a * 100u / (uint32_t)NAV_TURN_RATE_CENTI;
+    ms = Nav_Spin_Ms(a, NAV_TURN_T0_MS, NAV_TURN_RATE_CENTI);
 
     Spin((deg > 0) ? NAV_TURN_SPIN_V : -NAV_TURN_SPIN_V);
-    delay_ms(ms);
+    delay_ms((uint16_t)ms);
+    Stop();
+}
+
+// ============================================================================
+// 开环转向标定（不跑导航，main.c 的 Turn_Calib_Test 调用）
+//   DBG_TURN_DEG  : 目标角度，Watch 里直接改（正=右转、负=左转）
+//   DBG_TURN_T0   : 起步滞后 ms（默认 NAV_TURN_T0_MS=350）
+//   DBG_TURN_RATE : 角速度，单位 0.01°/ms（14 = 0.14°/ms）
+//   标定流程见开发记录 §22。收敛后把 T0/RATE 写回 nav.h 的两个宏。
+//   注意：这两个值只在标定程序里生效，正式导航仍用宏，避免被误改。
+// ============================================================================
+volatile int16_t  DBG_TURN_DEG     = 180;
+volatile uint16_t DBG_TURN_T0      = NAV_TURN_T0_MS;
+volatile uint16_t DBG_TURN_RATE    = NAV_TURN_RATE_CENTI;
+volatile uint16_t DBG_TURN_LAST_MS = 0;
+volatile uint16_t DBG_TURN_COUNT   = 0;
+// ★非 0 时直接用这个 ms 转，忽略 T0/RATE —— 用来直接试「N ms 到底转多少度」
+//   标定查表时最方便：设 DBG_TURN_DEG=180、DBG_TURN_MS_OVERRIDE=1900，看转多少。
+volatile uint16_t DBG_TURN_MS_OVERRIDE = 0;
+
+// 线性式：只给标定程序用（导航已改查表，不走这里）
+static uint32_t Nav_Spin_Ms_Linear(uint16_t a, uint16_t t0, uint16_t rate)
+{
+    if (rate == 0u) rate = 1u;
+    return (uint32_t)t0 + (uint32_t)a * 100u / (uint32_t)rate;
+}
+
+void Nav_Calib_SpinDeg(void)
+{
+    int16_t  deg = DBG_TURN_DEG;
+    uint32_t ms;
+    uint16_t a;
+
+    if (deg == 0) return;
+
+    a  = (uint16_t)((deg > 0) ? deg : -deg);
+    ms = (DBG_TURN_MS_OVERRIDE != 0u)
+       ? (uint32_t)DBG_TURN_MS_OVERRIDE
+       : Nav_Spin_Ms_Linear(a, DBG_TURN_T0, DBG_TURN_RATE);
+
+    DBG_TURN_LAST_MS = (uint16_t)ms;
+    DBG_TURN_COUNT++;
+
+    Spin((deg > 0) ? NAV_TURN_SPIN_V : -NAV_TURN_SPIN_V);
+    delay_ms((uint16_t)ms);
     Stop();
 }
 
@@ -387,12 +498,33 @@ static int16_t Nav_Delta(uint16_t t, uint16_t h)
 }
 
 // 转向并更新朝向
+//   ★转向后一律把巡航速度压到 NAV_TURN_EXIT_SPEED 再爬坡：
+//     转向刚结束、航向误差最大，此时若以 20 全速修正，PD 差速会把外侧轮推到 28，
+//     一次修正就是一记猛回头（车头画蛇、夹着的料被甩出去）。详见 trace.h 的说明。
 static void Nav_Turn_To(uint16_t target)
 {
     int16_t d = Nav_Delta(target, sg_heading);
 
+    // 留档：head_before + d 应等于 target；实转不足时看这三个数就能分清是
+    //   "d 本身算错（账本/朝向漂了）" 还是 "d 对但车没转够（标定/机械）"
+    DBG_NAV_HEAD_BEFORE = (uint8_t)sg_heading;
+    DBG_NAV_TURN_TGT    = (uint8_t)target;
+    DBG_NAV_TURN_DEG    = d;
+    DBG_NAV_TURN_MS     = (uint16_t)Nav_Spin_Ms((uint16_t)((d > 0) ? d : -d),
+                                                NAV_TURN_T0_MS, NAV_TURN_RATE_CENTI);
+
+    if (NAV_TURN_LOG_NUM < NAV_TURN_LOG_N)
+    {
+        uint8_t k = NAV_TURN_LOG_NUM;
+        NAV_TURN_LOG_HEAD[k] = (uint8_t)sg_heading;
+        NAV_TURN_LOG_TGT[k]  = (uint8_t)target;
+        NAV_TURN_LOG_MS[k]   = DBG_NAV_TURN_MS;
+        NAV_TURN_LOG_NUM++;
+    }
+
     Nav_SpinDeg(d);
     sg_heading = (uint16_t)(((int16_t)sg_heading + d + 360) % 360);
+    Trace_SpeedKick(NAV_TURN_EXIT_SPEED);
 }
 
 // 去内圆点的"长间隔线"门限：用上一段实测的最长间隔换算 190mm
@@ -438,21 +570,34 @@ static uint8_t Nav_Blocked_For(uint8_t t, uint8_t ignore_slot)
 // 读色（带重试）→ 目标角
 //   夹具闭合后颜色模块正对物料，所以必须在 Steering_RESET() 之后读。
 // ============================================================================
+//   ★2026-10-27 修：原来「读到一个有效值就用」，夹爪刚到位时的一次过渡读数
+//     （实测把红色读成黑色）会被直接采信 → 送错靶位。
+//     现在要求**连续两次读到同一个颜色**才采信；读不到有效值就继续读。
 static uint8_t Nav_ReadColor(void)
 {
-    uint8_t c = (uint8_t)TCS3200_COLOR_NONE;
+    uint8_t c     = (uint8_t)TCS3200_COLOR_NONE;
+    uint8_t valid = (uint8_t)TCS3200_COLOR_NONE; // 上一次读到、且有效的颜色
     uint8_t i;
 
-    for (i = 0u; i <= NAV_COLOR_RETRY; i++)
+    for (i = 0u; i <= NAV_COLOR_RETRY + 1u; i++)
     {
         c = (uint8_t)TCS3200_ReadColorStable(NAV_COLOR_SAMPLES);
-        if (c != (uint8_t)TCS3200_COLOR_NONE &&
-            c != (uint8_t)TCS3200_COLOR_UNKNOWN)
+        if (c == (uint8_t)TCS3200_COLOR_NONE ||
+            c == (uint8_t)TCS3200_COLOR_UNKNOWN)
         {
-            break;
+            continue;                 // 无效读数不参与比对
         }
+        if (c == valid)
+        {
+            return c;                 // 连续两次一致 → 采信
+        }
+        valid = c;                    // 第一次有效读数先记下，等下一次确认
     }
-    return c;
+
+    // 只读到一次有效值（没等到确认）：宁可用它也别整局报废，
+    // 但调用方会用 DBG_NAV_COLOR 看到它，便于事后核对
+    if (valid == (uint8_t)TCS3200_COLOR_NONE) return (uint8_t)TCS3200_COLOR_NONE;
+    return valid;
 }
 
 // 颜色 → 靶位角：绿0 白45 红90 黑135 蓝180（靶心都在大圆上）
@@ -710,6 +855,11 @@ void Nav_Init(void)
     DBG_NAV_COLOR         = 0;
     DBG_NAV_BACK_REASON   = 0;
     DBG_NAV_PLACE_REASON  = 0;
+    DBG_NAV_HEAD_BEFORE   = 0;
+    DBG_NAV_TURN_TGT      = 0;
+    DBG_NAV_TURN_DEG      = 0;
+    DBG_NAV_TURN_MS       = 0;
+    NAV_TURN_LOG_NUM      = 0;
 
     sg_target_angle = 0xFFu;
     sg_tgt_mode     = 0u;
@@ -717,8 +867,6 @@ void Nav_Init(void)
     sg_tgt_min_gap  = NAV_TARGET_MIN_GAP;
     sg_tgt_long     = 0u;
     sg_tgt_last     = 0u;
-    sg_back_armed   = 0u;
-    sg_back_last    = 0u;
 
     NAV_STOP_SNAPPED = 0;
     NAV_STOP_POS     = 0;
@@ -752,14 +900,16 @@ void Nav_Task2_Start(void)
     DBG_NAV_PLACE_REASON  = 0;
     NAV_STOP_SNAPPED      = 0;
 
+    // 相位黑匣子清零（每局重新记）
+    NAV_TRC_NUM = 0;
+    sg_trc_last = 0xFFu;
+
     sg_target_angle = 0xFFu;
     sg_tgt_mode     = 0u;
     sg_tgt_need     = 1u;
     sg_tgt_min_gap  = NAV_TARGET_MIN_GAP;
     sg_tgt_long     = 0u;
     sg_tgt_last     = 0u;
-    sg_back_armed   = 0u;
-    sg_back_last    = 0u;
 
     // 账本清零
     sg_heading       = 90u;            // 出发朝北
@@ -826,7 +976,7 @@ void Nav_Task2_Run(void)
         // --------------------------------------------------------------------
         case PATH_TURN_NAV:
             Stop();
-            delay_ms(250);              // 停稳再转
+            delay_ms(NAV_TURN_SETTLE_MS);   // 停稳再转（速度 18 需要更久，见 nav.h）
             Nav_Turn_To(sg_pick_angle); // 开环转向 + 更新 sg_heading
             DBG_NAV_TURN_POS  = F_GW_position();
             DBG_NAV_TURN_DONE = 1;
@@ -869,6 +1019,12 @@ void Nav_Task2_Run(void)
             }
             else if ((uint32_t)Nav.seg_ticks >= sg_cap_ticks)
             {
+                // ★2026-10-27 二次评估：**撤回**上一版「撞上限也照常夹取」的兜底。
+                //   实车证明它有害：车走错射线时会一路开到上限，然后在**错误位置**
+                //   闭合夹爪（抓空）、读到错误颜色、再送进错误靶位 ——
+                //   现场看到「回家后夹爪动了、抓空、又送去黑色区」就是这么来的。
+                //   停在原地至少是确定的失败，还能保留 DBG_NAV_A_REASON=9 的依据。
+                //   真正该修的是「为什么没走到点」（转向/抓线，见 NAV_TRC_*）。
                 DBG_NAV_A_REASON = 9;
                 Stop();
                 Nav_StopSnap();
@@ -960,21 +1116,20 @@ void Nav_Task2_Run(void)
             Trace_Backward();
             DBG_NAV_POS = DBG_pos;
 
-            // 两步停车：签名（斜线）只武装，继续退到圆心主轴线才停。
-            // 斜线在 r≈100mm 处被跨过，此时车心还没到圆心；直接停会让回家段的
-            // 数线起点每次不同（压不压过主轴线不一定）→ 位置不唯一。
-            if (!sg_back_armed)
+            // 一步停车：签名成立的那一刻，车心就在圆心。
+            //   ★2026-10-27 修（这是「回圆心多退 ≈100mm」的根因）：
+            //   原注释以为签名在「45° 斜线」处成立，再退一条线才到圆心 —— 前提是错的。
+            //   实际数线序列（A 点沿 0° 射线倒退，侧灰度偏移 d≈100mm）：
+            //     内圆(起步附近, gap≈16拍, prev_gap=0)     → 签名不成立
+            //     45°斜线(距圆心 d, gap≈246拍, prev_gap≈16)→ prev_gap<100，签名不成立
+            //     主辐射线(过圆心, gap≈89拍, prev_gap≈246) → 签名成立，而此刻车心已在圆心
+            //   跨 45° 线时 prev_gap 拿到的是「内圆→45°」那个短间隔，所以签名只会
+            //   在跨主轴线时成立。原来再等下一根线 = 多退 d ≈100mm，
+            //   实车表现为「侧灰度退到米字线右下」→ 转 45° 后车不在射线上、前灰度全白。
+            if (Nav_BackCenter_Check())
             {
-                if (Nav_BackCenter_Check())
-                {
-                    sg_back_armed = 1u;
-                    sg_back_last  = sg_line_count;
-                }
-            }
-            else if (sg_line_count > sg_back_last ||
-                     sg_ticks >= NAV_BACK_CENTER_GRACE)
-            {
-                DBG_NAV_BACK_REASON = 1;
+                DBG_NAV_BACK_SIG_GAP = sg_gap; // 签名段的间隔拍数，≈89 表示正常跨到圆心
+                DBG_NAV_BACK_REASON  = 2u;
                 Stop();
                 delay_ms(200); // 惯性停稳再决策
                 Nav_StopSnap();
@@ -997,7 +1152,7 @@ void Nav_Task2_Run(void)
         // --------------------------------------------------------------------
         case PATH_TURN_TO_TARGET:
             Stop();
-            delay_ms(250);
+            delay_ms(NAV_TURN_SETTLE_MS);   // 停稳再转（与标定条件一致）
             Nav_Turn_To(sg_target_angle);
             DBG_NAV_TURN_POS  = F_GW_position();
             DBG_NAV_TURN_DONE = 1;
@@ -1164,19 +1319,11 @@ void Nav_Task2_Run(void)
             Trace_Backward();
             DBG_NAV_POS = DBG_pos;
 
-            // 与 BACK_TO_CENTER 同一套两步停车：斜线武装 → 主轴线到圆心停
-            if (!sg_back_armed)
+            // 与 BACK_TO_CENTER 同一套一步停车：签名成立 = 车心已在圆心（根因见上）
+            if (Nav_BackCenter_Check())
             {
-                if (Nav_BackCenter_Check())
-                {
-                    sg_back_armed = 1u;
-                    sg_back_last  = sg_line_count;
-                }
-            }
-            else if (sg_line_count > sg_back_last ||
-                     sg_ticks >= NAV_BACK_CENTER_GRACE)
-            {
-                DBG_NAV_BACK_REASON = 1;
+                DBG_NAV_BACK_SIG_GAP = sg_gap;
+                DBG_NAV_BACK_REASON  = 2u;
                 Stop();
                 delay_ms(200);
                 Nav_StopSnap();
@@ -1199,7 +1346,7 @@ void Nav_Task2_Run(void)
         // --------------------------------------------------------------------
         case PATH_TURN_TO_HOME:
             Stop();
-            delay_ms(250);
+            delay_ms(NAV_TURN_SETTLE_MS);   // 停稳再转（与标定条件一致）
             Nav_Turn_To(NAV_HOME_ANGLE);
             DBG_NAV_TURN_POS  = F_GW_position();
             DBG_NAV_TURN_DONE = 1;
@@ -1245,6 +1392,7 @@ void Nav_Task2_Run(void)
     }
 
     Nav_LogTick();
+    Nav_TrcPhase();
 }
 
 uint8_t Nav_GetPhase(void)

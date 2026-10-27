@@ -55,6 +55,10 @@ static int16_t trace_last_side = 0;
 static uint8_t trace_lost_ticks = 0;   // 丢线后累计拍数（扫线换向用）
 static int16_t trace_search_dir = 1;   // 丢线且方向未知时的扫线方向：+1/-1
 
+// 巡航速度爬坡（转向后限速用，见 Trace_SpeedKick）
+static int16_t trace_speed      = LINE_SPEED; // 当前实际下发的巡航速度
+static uint8_t trace_ramp_cnt   = 0u;         // 爬坡计数（每 TRACE_RAMP_STEP_TICKS 拍 +1）
+
 // ----------------------------------------------------------------------------
 // 差速底盘基础接口
 //   左轮 = Motor_201(左前) + Motor_204(左后)
@@ -136,7 +140,45 @@ void Trace_Forward(void)
         trace_search_dir = 1;
     }
 
-    Line_Follow(LINE_SPEED);
+    // 巡航速度爬坡：转向后先低速再逐步加到 LINE_SPEED（见 Trace_SpeedKick）
+    if (trace_speed < LINE_SPEED)
+    {
+        if (++trace_ramp_cnt >= TRACE_RAMP_STEP_TICKS)
+        {
+            trace_ramp_cnt = 0u;
+            trace_speed++;
+        }
+    }
+    else
+    {
+        trace_speed    = LINE_SPEED;
+        trace_ramp_cnt = 0u;
+    }
+
+    Line_Follow(trace_speed);
+}
+
+// ----------------------------------------------------------------------------
+// 转向后限速（爬坡起点）
+//   为什么需要：PD 差速会让外侧轮变成 V+u。V=20、U_LIMIT=8 时外侧轮 28，
+//   比巡航还快 40%，转向刚结束、航向误差最大，这一拍就是一记猛回头 → 画蛇/抖动，
+//   夹着料时还会把料甩出去。
+//   把 V 降到 12 起步，外侧轮只有 12+5=17，修正平缓；随后每
+//   TRACE_RAMP_STEP_TICKS 拍 +1，约 0.4s 回到 LINE_SPEED。
+//   ⚠ U_LIMIT 在 Trace_Output 里按当前 V 等比缩放（见那里的 u_cap），
+//     所以低速段差速权也是 42%，不会因为「限幅没跟着降」而更猛。
+// ----------------------------------------------------------------------------
+void Trace_SpeedKick(int16_t v)
+{
+    if (v < 1) v = 1;
+    if (v > LINE_SPEED) v = LINE_SPEED;
+    trace_speed    = v;
+    trace_ramp_cnt = 0u;
+}
+
+int16_t Trace_GetSpeed(void)
+{
+    return trace_speed;
 }
 
 // ----------------------------------------------------------------------------
@@ -258,8 +300,16 @@ static void Trace_Output(float e, int16_t V)
     trace_e_last = e;
 
     // 差速量既不能超过 U_LIMIT，也不能让任一侧轮子反向（否则变成原地打转）
+    // ★2026-10-27：U_LIMIT 按当前速度等比缩放。
+    //   转向后爬坡时 V 只有 12，若还按 8 限幅，差速权就是 8/12=67%（比巡航 40% 更猛），
+    //   限速就白限了。按 V 缩放后，任何速度下差速权都是 U_LIMIT/LINE_SPEED≈40%。
     u_lim = (V >= 0) ? (V - 1) : (-V - 1);
-    if (u_lim > U_LIMIT) u_lim = U_LIMIT;
+    {
+        int16_t u_cap = (int16_t)(((int32_t)U_LIMIT * ((V >= 0) ? V : -V)
+                                   + LINE_SPEED / 2) / LINE_SPEED);
+        if (u_cap < 1) u_cap = 1;
+        if (u_lim > u_cap) u_lim = u_cap;
+    }
     if (u_lim < 1) u_lim = 1;
 
     if (u > (float)u_lim) u = (float)u_lim;

@@ -669,6 +669,47 @@ static void Trace_Follow_Test(void)
     }
 }
 
+/* ============================================================================
+ * 开环标定（不跑导航）
+ *   KEY0：按 DBG_TURN_DEG 转一次（Watch 里改角度，正=右转 负=左转）
+ *   KEY1：直线前进 1000ms 后停 —— 量停车滑行距离
+ * Watch 加这几个：
+ *   DBG_TURN_DEG / DBG_TURN_T0 / DBG_TURN_RATE / DBG_TURN_LAST_MS / DBG_TURN_COUNT
+ *   DBG_CALIB_MS（最近一次直线前进的毫秒数，固定 1000）
+ * ========================================================================== */
+volatile uint16_t DBG_CALIB_MS = 1000; // 直线标定时长（ms），Watch 里直接改，不用重编
+
+static void Turn_Calib_Test(void)
+{
+    uint8_t k0_cnt = 0, k0_stable = 0;
+    uint8_t k1_cnt = 0, k1_stable = 0;
+    uint8_t round  = 0;   /* 0=下次按 KEY1 跑 5s，1=下次跑 8s */
+
+    Stop();
+
+    while (1) {
+        if (Enc_Key_Debounce(KEY0_DOWN(), &k0_cnt, &k0_stable)) {
+            /* 转 DBG_TURN_DEG 度，转完自动停 */
+            Nav_Calib_SpinDeg();
+        }
+
+        if (Enc_Key_Debounce(KEY1_DOWN(), &k1_cnt, &k1_stable)) {
+            /* 直线里程标定：第一次按 5s，第二次按 8s，之后交替。
+               放回起点再按；量车头最终位置到起点的距离 D5 / D8。 */
+            DBG_CALIB_MS = (round == 0u) ? 5000u : 8000u;
+            round ^= 1u;
+
+            Diff_Drive(LINE_SPEED, LINE_SPEED);
+            delay_ms(DBG_CALIB_MS);
+            Stop();
+        }
+
+        Stop();
+        DBG_LOOP_CNT++;
+        delay_ms(10);
+    }
+}
+
 int main()
 {
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
@@ -694,10 +735,14 @@ int main()
     Stop();
 
     /* ==================== 模式入口：同时只放开一行 ==================== */
-    // 当前：第一题（KEY0 启动 → 出发区→圆心→左转90°→A点；KEY1 急停）
+    // 当前：第一题整局（KEY0 启动 / KEY1 急停）
     Nav_Task2_Test();
 
-    // Trace_Follow_Test(); // 对照：纯向前循迹（KEY0 向前循迹 / KEY1 停车），不碰 nav
+    // 开环标定：KEY0 转 DBG_TURN_DEG 度 / KEY1 直线 5s、8s 量速度
+    //   标定转向：DBG_TURN_DEG=180、DBG_TURN_MS_OVERRIDE=1900，按 KEY0 看转多少度
+    //   标定速度：KEY1 交替 5s / 8s，量里程算 18 速的真实车速
+    // Turn_Calib_Test();
+    // Trace_Follow_Test();  // 对照：纯向前循迹（KEY0 向前循迹 / KEY1 停车），不碰 nav
 
     // Encoder_Calib_Test(); // 编码器测试/标定（上电静止自动探针 → KEY0 前进 5 秒 → 自动锁存）
 

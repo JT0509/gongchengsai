@@ -35,9 +35,8 @@
 //     ⚠ 实车实测：侧灰度横向偏移 d≈100mm（不是方案假设的50mm），
 //       315°线→0°线 ≈100mm≈130拍，而 315°线自己的间隔 ≈430拍，
 //       比例只有 3.3，用 ×4 会漏判。×2 仍能区分正常间隔（242/152=1.6、336/242=1.4）。
-//   NAV_CENTER_PREV_MIN   签名要求上次间隔 ≥150 拍，排除起步抖动
-//   NAV_CENTER_GAP_MAX    签名要求本次间隔 ≤300 拍，排除噪声短间隔
-//     （d≈100mm，电池弱车速降到 40mm/s 时约 220 拍，留到 300 才不会卡死）
+//   NAV_CENTER_PREV_MIN   签名要求上次间隔 ≥100 拍（@速度18 拍距1.10）≈110mm
+//   NAV_CENTER_GAP_MAX    签名要求本次间隔 ≤176 拍≈216mm，排除噪声短间隔
 //
 //   NAV_CENTER_MAX_TICKS  ⚠ 只是「一条线都没数到」时的兜底。
 //   实车实测：62mm/s、拍周期 11.5ms → 拍距 ≈0.72mm/拍，圆心 780mm ≈1040 拍，
@@ -46,8 +45,8 @@
 //   再乘 1.5~2 倍余量作为上限（见 nav.c 的 Nav_Update_Cap），
 //   电池掉电、车速变化都不会再提前截停。
 // ----------------------------------------------------------------------------
-//   ⚠ 2026-10-27 提速 12→18：拍距 0.72→≈1.07mm/拍，下面拍数门限已 ×2/3。
-//     参照量不变：PREV_MIN 100 拍 ≈107mm、GAP_MAX 200 拍 ≈214mm。
+//   ⚠ 2026-10-27 速度 12→18：拍距 0.72→1.10mm/拍，下面门限已 ×0.655（=0.72/1.10）。
+//     18 速未实测，v 由 12/20 两点插值得 95.8mm/s；改速度按「×0.72÷实测拍距」重算，见开发记录 §22。
 #define NAV_CENTER_LINE       5
 #define NAV_CENTER_LINE_FB    6
 #define NAV_CENTER_GAP_RATIO  2
@@ -68,8 +67,8 @@
 //                   （315°线，≈336mm 对应 430 拍）换算出 390mm 需要多少拍，
 //                   再乘 1.5 余量（见 PATH_TURN_LEFT），电池掉电也不会提前截停。
 // ----------------------------------------------------------------------------
-#define NAV_A_LINE_MIN_GAP 100  // 兜底值（150×2/3）；正常由 sg_max_gap×190/336 动态计算
-#define NAV_A_MIN_TICKS    167  // 250×2/3
+#define NAV_A_LINE_MIN_GAP 100   // 兜底值（150×0.655）；正常由 sg_max_gap×190/336 动态计算
+#define NAV_A_MIN_TICKS    167  // 250×0.655≈164，取 167 ≈184mm
 #define NAV_A_MAX_TICKS    1000
 
 // ----------------------------------------------------------------------------
@@ -104,8 +103,30 @@
 //   实车标定：地上画 45/90/135/180 参考线各转 5~10 次取平均。
 //   符号：Nav_SpinDeg 正 = 右转（顺时针，φ 增大），负 = 左转。
 // ----------------------------------------------------------------------------
-#define NAV_TURN_T0_MS        350
-#define NAV_TURN_RATE_CENTI   14   // 0.14°/ms 用「每 100ms 多少度」的整数表示
+// 转弯前停稳时间（★2026-10-27 加）
+//   原来是写死的 250ms，速度 12 时够用；提到 18/20 后车还没完全停住就开始 Spin，
+//   前半段旋转被「从前进减速到零再反向」吃掉 → 实际转角偏小，而且每次差一点。
+//   更要命的是：标定程序 Turn_Calib_Test 是**从静止起步**转的，实跑是**高速急停后**转的，
+//   标定条件和实跑条件不一致，标出来的 RATE 搬过去必然偏。
+//   加长到 600ms 后，实跑条件 ≈ 标定条件（都从完全静止起步）。
+//   ⚠ 改这个值之后必须重新标 RATE，否则标定值对不上。
+#define NAV_TURN_SETTLE_MS    600
+#define NAV_TURN_T0_MS        110   // ★350→50→110。实跑 180° 偏大（90° 能靠循迹找回、
+                                   //   180° 找不回），整体缩一档：RATE 10→11 把斜率抬起来，
+                                   //   小角度那段用 T0 补回来，避免 45° 转少了。
+// 转向结束后重新循迹的起步速度（随后自动爬坡回 LINE_SPEED）
+//   20 速全速修正 = 外侧轮 28（比巡航快 40%）→ 猛回头、画蛇、把料甩出去。
+//   降到 12 起步：外侧轮只有 17，修正平缓。爬坡 5 拍/档，12→20 约 0.46s 回满。
+//   若转向后仍然摆：继续降到 10；若觉得加速太肉：把 TRACE_RAMP_STEP_TICKS 调小。
+#define NAV_TURN_EXIT_SPEED   12
+#define NAV_TURN_RATE_CENTI   11   // 0.11°/ms。180° 实测偏大后上调一档（10→11）
+                                   // 自检（ms = 110 + deg×100/11）：
+                                   //   45°→519、90°→928、135°→1337、180°→1746
+                                   // 对比上一版（T0=50/RATE=10）：
+                                   //   45° 500→519（+19ms，小角度补偿）
+                                   //   90° 950→928（−22ms）
+                                   //   180° 1850→1746（−104ms ≈ 少转 11°）
+                                   // 只做粗定位，45° 格点上的 ±10° 由前灰度循迹拉回
 
 // ----------------------------------------------------------------------------
 // A 点取料 → 读色送靶位（单块闭环）
@@ -113,7 +134,11 @@
 //   此时物料已完整进入夹口（实测确认）→ **不需要微进**，停车即可夹。
 //   夹住后夹具正好把颜色模块送到物料正前方 → **夹完再读色**。
 // ----------------------------------------------------------------------------
-#define NAV_CLAMP_SETTLE_MS 300  // 夹紧后等夹爪力建立再读色
+//   ★2026-10-27 修：原来 300ms，但舵机全行程 59° 约需 0.6s（见 steering.c 注释），
+//     加上 CLAMP_DELAY 300ms 总共只有 600ms —— 正好卡在「刚到位」，读色时夹爪还在动，
+//     颜色模块没对准料 → 实测把红色读成黑色 → 送错靶位。
+//     现在留 400ms 余量：300+700=1000ms，舵机肯定到位后再读。
+#define NAV_CLAMP_SETTLE_MS 700  // 夹紧后等夹爪完全到位再读色（≥舵机全行程 600ms + 余量）
 #define NAV_COLOR_SAMPLES   3    // ReadColorStable 投票次数（≈660ms）
 #define NAV_COLOR_RETRY     2    // 读不到时原地重读次数，仍失败则 ABORT
 #define NAV_INCH_V          8    // 微进/退后的低速（速度寄存器）
@@ -121,20 +146,23 @@
 #define NAV_BACKOFF_MS      500  // 放完料退后 ≈20mm，让夹爪脱离物料
 
 //   回圆心（A→圆心倒退 390mm，后灰度 PD）
-//   签名：最后两条线（斜线≈100mm → 主辐射线）间隔骤减，复用圆心判据
-//   ★2026-10-27 修：签名在「斜线」处就触发了，此时车心还在离圆心 ≈100mm 的地方。
-//     原代码直接停车 → 每次「回圆心」实际停在 r≈100mm，回家段的数线起点因此不确定
-//     （压不压过圆心主轴线每次不同）→ 这就是「回家位置不唯一」的根因。
-//     现在签名只负责「武装」，继续倒退直到跨过圆心主轴线（或超 GRACE 拍）才停，
-//     停车点回到真正的圆心，后续所有「从圆心出发」的段都受益。
+//   签名：最后两条线（斜线 → 主辐射线）间隔骤减，复用圆心判据
+//   ★★2026-10-27 终极修复（「回圆心多退 ≈100mm」的根因）：
+//     「签名在斜线处成立、再退一条线才到圆心」这个前提是错的。实际数线序列：
+//       内圆(起步附近, prev_gap=0)      → 不成立
+//       45°斜线(距圆心 d, prev_gap≈16)  → prev_gap<100，不成立
+//       主辐射线(过圆心, prev_gap≈246)  → 成立，而此刻车心已在圆心
+//     所以签名只会在跨主轴线时成立，再等下一根线必然多退 d≈100mm
+//     （实车表现：侧灰度退到米字线右下 → 转 45° 后车不在射线上、前灰度全白）。
+//     现在改为「签名成立即停」，见 nav.c 的 PATH_BACK_TO_CENTER / BACK_FROM_TARGET。
 #define NAV_BACK_MAX_TICKS      900
-#define NAV_BACK_CENTER_GRACE   120  // 武装后等主轴线的兜底：100mm≈93拍，留 1.3 倍
+#define NAV_BACK_CENTER_GRACE   90   // 已废弃（原两步停车的兜底），保留仅为兼容
 
 //   靶位段（圆心→靶位 780mm，或绿的 A→大圆 ≈390mm）
 //   非绿沿途：斜线(≈100mm 短) → 内圆(≈277mm 长) → 大圆(≈396mm 长)
 //             → 数到第 2 条「长间隔线」就是大圆
 //   绿  沿途：已过内圆，只有大圆一条 → 数到第 1 条就是大圆
-#define NAV_TARGET_MIN_GAP        176  // 长间隔线门槛（190mm≈176拍，介于 100/277mm 之间）
+#define NAV_TARGET_MIN_GAP        176  // 长间隔线门槛（190mm≈154拍，介于 100/277mm 之间）
 #define NAV_TARGET_LONG_NEED      2    // 非绿：第 2 条长间隔线 = 大圆
 #define NAV_TARGET_MAX_TICKS      1400 // 非绿绝对兜底（圆心→大圆 780mm≈1083拍）
 #define NAV_TARGET_GREEN_MAX_TICKS 800  // 绿兜底（A→大圆 ≈390mm≈547拍）
@@ -158,7 +186,7 @@
 //   NAV_TARGET_ARM_TICKS：先连续这么多拍"看到线"才允许判特征，
 //     防止刚出圆心时阵列还压在圆心黑区里被误判。
 //   NAV_TARGET_BLACK_K  ：特征连续这么多拍才算一次（消抖）。
-#define NAV_TARGET_ARM_TICKS 20  // 30×2/3
+#define NAV_TARGET_ARM_TICKS 20  // 30×0.6
 #define NAV_TARGET_BLACK_K   2
 
 //   前灰度字节位定义（黑=1、白=0；探头1=bit7 … 探头8=bit0）
@@ -195,7 +223,7 @@
 //   同心圆与车头朝向无关，起步偏了也不影响间隔。
 #define NAV_HOME_ANGLE        270
 #define NAV_HOME_NEED         3    // 长间隔线：内圆、出发圆、大圆
-#define NAV_HOME_MIN_GAP      117  // 126mm：> 斜线93拍、< 大圆段141拍，两侧各留 ≈20%
+#define NAV_HOME_MIN_GAP      117  // 126mm：> 斜线81拍、< 大圆段124拍，两侧各留 ≈20%
 #define NAV_HOME_MAX_TICKS    2600
 
 // 从大圆（靶位）倒退回圆心：780mm，车速降到 30mm/s 时约 2260 拍
@@ -234,6 +262,16 @@ void Nav_Task2_Run(void);   // 第一题每控制周期推进
 //   11=DECIDE(查账本选下一步) 12=BACK_FROM_TARGET(大圆倒退) 13=TURN_TO_HOME 14=TO_HOME
 uint8_t Nav_GetPhase(void);
 
+// ==================== 开环转向标定（main.c 的 Turn_Calib_Test 用） ====================
+// 标定程序里生效，正式导航仍用 NAV_TURN_T0_MS / NAV_TURN_RATE_CENTI 两个宏。
+extern volatile int16_t  DBG_TURN_DEG;     // 目标角度：正=右转、负=左转（Watch 里改）
+extern volatile uint16_t DBG_TURN_T0;      // 起步滞后 ms
+extern volatile uint16_t DBG_TURN_RATE;    // 角速度，0.01°/ms（14 = 0.14°/ms）
+extern volatile uint16_t DBG_TURN_LAST_MS; // 上一次实际延时（核对用）
+extern volatile uint16_t DBG_TURN_MS_OVERRIDE; // 非 0 = 直接按此 ms 转，忽略 T0/RATE
+extern volatile uint16_t DBG_TURN_COUNT;   // 累计转动次数
+void Nav_Calib_SpinDeg(void);              // 按 DBG_TURN_DEG 转一次
+
 // ==================== 无串口调试变量（Cortex-Debug Watch） ====================
 extern volatile int16_t  DBG_NAV_POS;        // 前灰度位置（trace.c 的 DBG_pos 镜像）
 extern volatile uint8_t  DBG_NAV_SGW;        // 侧灰度原始读数（1=黑 0=白）
@@ -250,12 +288,48 @@ extern volatile int16_t  DBG_NAV_TURN_POS;      // 转完后前灰度位置（�
 extern volatile uint8_t  DBG_NAV_SERVO;         // 夹爪/物料状态：0=张开（空车） 1=夹住（有料）
                                                 // ★靶位判据的硬性门：只有=1 才允许认靶位
 extern volatile uint8_t  DBG_NAV_COLOR;         // 判色结果（1白 2黑 3红 4绿 5蓝，0=读不出来）
-extern volatile uint8_t  DBG_NAV_BACK_REASON;   // 回圆心停因：1=签名 9=拍数上限
+extern volatile uint8_t  DBG_NAV_BACK_REASON;   // 回圆心停因：2=签名成立停（正常） 9=拍数上限
+extern volatile uint16_t DBG_NAV_BACK_SIG_GAP;  // 签名段的间隔拍数：≈89 拍(100mm) 说明正常跨到圆心
+// 最近一次转向留档（区分「指令角度错」还是「执行不到位」）
+extern volatile uint8_t  DBG_NAV_HEAD_BEFORE;   // 转向前 sg_heading
+extern volatile uint8_t  DBG_NAV_TURN_TGT;      // 目标角
+extern volatile int16_t  DBG_NAV_TURN_DEG;      // 实际下发转角（带符号，+=右转）
+extern volatile uint16_t DBG_NAV_TURN_MS;       // 旋转延时 ms
+// 整局转向流水：按顺序记录每次转向，d = TGT − HEAD（最短路径）
+//   Watch 里看 NAV_TURN_LOG_NUM，再展开三个数组逐个核对
+//   MS 核对：45°→447、90°→545、135°→643、180°→741
+#define NAV_TURN_LOG_N  16
+extern volatile uint8_t  NAV_TURN_LOG_NUM;
+extern volatile uint8_t  NAV_TURN_LOG_HEAD[NAV_TURN_LOG_N];
+extern volatile uint8_t  NAV_TURN_LOG_TGT[NAV_TURN_LOG_N];
+extern volatile uint16_t NAV_TURN_LOG_MS[NAV_TURN_LOG_N];
 extern volatile uint8_t  DBG_NAV_PLACE_REASON;  // 投料停因：1=前灰度特征 2=侧灰度兜底 9=拍数上限
 
 // ==================== 黑匣子（attach 读 RAM 回放） ====================
 // 每拍环形记录最近 NAV_LOG_N 拍；停车瞬间锁存 NAV_STOP_* 快照。
 #define NAV_LOG_N 128
+
+// ----------------------------------------------------------------------------
+// 相位迁移黑匣子：每次进入新相位记一条（NAV_LOG_* 只留最近 128 拍 ≈1.3s，整局查不了）
+//   跑完 attach 后按 0..NAV_TRC_NUM-1 顺序看，就能还原整局的流程走向。
+//   NAV_TRC_PHASE  进入的相位（见 nav_phase 表）
+//   NAV_TRC_HEAD   进入时的朝向估计 sg_heading（0°=西 90°=北 180°=东 270°=南）
+//   NAV_TRC_AIM    该步的目标角（去点取料 = pick_angle，转靶位 = target_angle）
+//   典型判读：「该去 A 却直接回家」→ 若记录的是 PATH_TURN_TO_HOME(13)，
+//             说明 Nav_Plan_Pick 返回了 0（账本认为三块都取完），是账本错了。
+// ----------------------------------------------------------------------------
+#define NAV_TRC_N 40
+extern volatile uint8_t NAV_TRC_NUM;
+extern volatile uint8_t NAV_TRC_PHASE[NAV_TRC_N];
+extern volatile uint8_t NAV_TRC_HEAD[NAV_TRC_N];
+extern volatile uint8_t NAV_TRC_AIM[NAV_TRC_N];
+//   NAV_TRC_LED    当时账本的打包快照（查「为什么它决定回家」的关键）：
+//     bit0~1  sg_picked（已取几块，0~3）
+//     bit2    taken[0]  A 已取     bit3  taken[1]  C 已取     bit4  taken[2]  E 已取
+//     bit5    stage[0] 非空（白料暂存在 B）  bit6  stage[1] 非空（黑料暂存在 D）
+//     bit7    sg_claw 非 0（手上夹着料）
+//   判读：「料没投完却 TURN_TO_HOME(13)」→ 看 LED，若 picked=3 或 taken 全 1，就是账本错了。
+extern volatile uint8_t NAV_TRC_LED[NAV_TRC_N];
 extern volatile uint8_t  NAV_LOG_I;                    // 下一个写入位置
 extern volatile int16_t  NAV_LOG_POS[NAV_LOG_N];       // 前灰度位置
 extern volatile uint16_t NAV_LOG_LINES[NAV_LOG_N];     // 跨线数
