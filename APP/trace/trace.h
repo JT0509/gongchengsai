@@ -19,8 +19,13 @@
 //  例：KP_LINE=0.6 → 偏 1 格 u≈3、偏 2 格 u≈6（再被 U_LIMIT 限到 5）
 //  KP_LINE / KD_LINE / POS_FILTER_ALPHA 同时被 nav.c 的 Nav_PD 使用
 // ============================================================================
-#define LINE_SPEED 12
-#define TRACE_BACK_SPEED 12  // 后退循迹速度（与前进分开调：后退打滑/过冲时只改这个）
+// ⚠ 2026-10-27 提速：12 → 18（+50%）。电机闭环，速度寄存器与 mm/s 近似线性：
+//    12 → 62mm/s、拍距 0.72mm/拍；18 → ≈93mm/s、拍距 ≈1.07mm/拍。
+//    nav.h 里所有「拍数门限」已按 ×2/3 同步缩放，改速度必须一起改。
+//    PD 若震荡（DBG_pos 不收敛）先把 KP_LINE 降到 0.45~0.5、U_LIMIT 提到 6。
+#define LINE_SPEED 18
+#define TRACE_BACK_SPEED 18  // 后退循迹速度（与前进分开调：后退打滑/过冲时只改这个）
+                             // 与前进同速，拍距才一致，nav.h 的门限才能共用一套
 #define U_LIMIT    5
 #define LOST_TURN  4
 #define LOST_SWEEP_TICKS 40

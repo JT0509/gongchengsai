@@ -40,13 +40,17 @@ virtualFolder:
         - path: APP/usart/usart.c
         - path: APP/motor/motor.c
         - path: APP/color/color.c
+        - path: APP/color/tcs3200.c
         - path: APP/sensor/sensor.c
         - path: APP/sensor/F_GREY_driver.c
         - path: APP/sensor/B_GREY_driver.c
-        - path: APP/sensor/L_GREY_driver.c
-        - path: APP/sensor/R_GREY_driver.c
+        - path: APP/sensor/S_GREY_driver.c
+        - path: APP/sensor/grey_i2c.c
         - path: APP/trace/trace.c
         - path: APP/VOFA/VOFA.c
+        - path: APP/key/key.c
+        - path: APP/steering/steering.c
+        - path: APP/nav/nav.c
       folders: []
     - name: Public
       files:
@@ -75,6 +79,9 @@ targets:
         - APP/color
         - APP/trace
         - APP/VOFA
+        - APP/key
+        - APP/nav
+        - APP/steering
         - .cmsis/include
         - RTE/_Target 1
       libList: []

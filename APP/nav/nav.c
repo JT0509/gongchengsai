@@ -115,6 +115,11 @@ static uint8_t  sg_tgt_mode     = 0u;
 static uint8_t  sg_tgt_need     = 1u;
 static uint8_t  sg_tgt_long     = 0u;
 static uint16_t sg_tgt_last     = 0u;
+static uint16_t sg_tgt_min_gap  = NAV_TARGET_MIN_GAP; // 长间隔线门槛（靶位/回家各一套）
+
+// 回圆心：签名（斜线）只武装，继续倒退到圆心主轴线才停，见 nav.h NAV_BACK_CENTER_GRACE
+static uint8_t  sg_back_armed   = 0u;
+static uint16_t sg_back_last    = 0u;
 
 // 前灰度判靶位状态机：arm(先看到线) → 数"靶位特征"脉冲
 static uint8_t  sg_fr_armed  = 0u;  // 1=已武装，可以开始数特征
@@ -194,6 +199,8 @@ static void Nav_Counter_Init(uint8_t count_foot)
     sg_prev_gap   = 0;
     sg_max_gap    = 0;
     sg_line_count = 0;
+    sg_back_armed = 0u;  // 新的一段开始，"已过斜线"标志必须清
+    sg_back_last  = 0u;
 
     if (black_now && count_foot)
     {
@@ -652,7 +659,7 @@ static uint8_t Nav_Target_Check(void)
     if (sg_line_count == sg_tgt_last) return 0u; // 没有新线
     sg_tgt_last = sg_line_count;
 
-    if (sg_tgt_mode && sg_gap < NAV_TARGET_MIN_GAP) return 0u; // 短间隔线不算
+    if (sg_tgt_mode && sg_gap < sg_tgt_min_gap) return 0u; // 短间隔线不算
 
     sg_tgt_long++;
 
@@ -707,8 +714,11 @@ void Nav_Init(void)
     sg_target_angle = 0xFFu;
     sg_tgt_mode     = 0u;
     sg_tgt_need     = 1u;
+    sg_tgt_min_gap  = NAV_TARGET_MIN_GAP;
     sg_tgt_long     = 0u;
     sg_tgt_last     = 0u;
+    sg_back_armed   = 0u;
+    sg_back_last    = 0u;
 
     NAV_STOP_SNAPPED = 0;
     NAV_STOP_POS     = 0;
@@ -745,8 +755,11 @@ void Nav_Task2_Start(void)
     sg_target_angle = 0xFFu;
     sg_tgt_mode     = 0u;
     sg_tgt_need     = 1u;
+    sg_tgt_min_gap  = NAV_TARGET_MIN_GAP;
     sg_tgt_long     = 0u;
     sg_tgt_last     = 0u;
+    sg_back_armed   = 0u;
+    sg_back_last    = 0u;
 
     // 账本清零
     sg_heading       = 90u;            // 出发朝北
@@ -947,15 +960,30 @@ void Nav_Task2_Run(void)
             Trace_Backward();
             DBG_NAV_POS = DBG_pos;
 
-            if (Nav_BackCenter_Check())
+            // 两步停车：签名（斜线）只武装，继续退到圆心主轴线才停。
+            // 斜线在 r≈100mm 处被跨过，此时车心还没到圆心；直接停会让回家段的
+            // 数线起点每次不同（压不压过主轴线不一定）→ 位置不唯一。
+            if (!sg_back_armed)
+            {
+                if (Nav_BackCenter_Check())
+                {
+                    sg_back_armed = 1u;
+                    sg_back_last  = sg_line_count;
+                }
+            }
+            else if (sg_line_count > sg_back_last ||
+                     sg_ticks >= NAV_BACK_CENTER_GRACE)
             {
                 DBG_NAV_BACK_REASON = 1;
                 Stop();
                 delay_ms(200); // 惯性停稳再决策
                 Nav_StopSnap();
                 nav_phase = PATH_DECIDE;
+                break;
             }
-            else if ((uint32_t)Nav.seg_ticks >= sg_cap_ticks)
+
+            if (nav_phase == PATH_BACK_TO_CENTER &&
+                (uint32_t)Nav.seg_ticks >= sg_cap_ticks)
             {
                 DBG_NAV_BACK_REASON = 9;
                 Stop();
@@ -974,11 +1002,12 @@ void Nav_Task2_Run(void)
             DBG_NAV_TURN_POS  = F_GW_position();
             DBG_NAV_TURN_DONE = 1;
 
-            sg_tgt_mode  = 1u;
-            sg_tgt_need  = NAV_TARGET_LONG_NEED;
-            sg_tgt_long  = 0u;
-            sg_tgt_last  = 0u;
-            sg_cap_ticks = NAV_TARGET_MAX_TICKS;
+            sg_tgt_mode    = 1u;
+            sg_tgt_need    = NAV_TARGET_LONG_NEED;
+            sg_tgt_min_gap = NAV_TARGET_MIN_GAP;
+            sg_tgt_long    = 0u;
+            sg_tgt_last    = 0u;
+            sg_cap_ticks   = NAV_TARGET_MAX_TICKS;
             Nav_Front_Reset();
             Nav_Counter_Init(0); // 圆心黑芯/射线上，等白了再数
             nav_phase = PATH_TO_TARGET;
@@ -1135,15 +1164,28 @@ void Nav_Task2_Run(void)
             Trace_Backward();
             DBG_NAV_POS = DBG_pos;
 
-            if (Nav_BackCenter_Check())
+            // 与 BACK_TO_CENTER 同一套两步停车：斜线武装 → 主轴线到圆心停
+            if (!sg_back_armed)
+            {
+                if (Nav_BackCenter_Check())
+                {
+                    sg_back_armed = 1u;
+                    sg_back_last  = sg_line_count;
+                }
+            }
+            else if (sg_line_count > sg_back_last ||
+                     sg_ticks >= NAV_BACK_CENTER_GRACE)
             {
                 DBG_NAV_BACK_REASON = 1;
                 Stop();
                 delay_ms(200);
                 Nav_StopSnap();
                 nav_phase = PATH_DECIDE;
+                break;
             }
-            else if ((uint32_t)Nav.seg_ticks >= sg_cap_ticks)
+
+            if (nav_phase == PATH_BACK_FROM_TARGET &&
+                (uint32_t)Nav.seg_ticks >= sg_cap_ticks)
             {
                 DBG_NAV_BACK_REASON = 9;
                 Stop();
@@ -1162,11 +1204,13 @@ void Nav_Task2_Run(void)
             DBG_NAV_TURN_POS  = F_GW_position();
             DBG_NAV_TURN_DONE = 1;
 
-            sg_tgt_mode  = 0u; // 任意线都算（斜线→内圆→出发圆缘→大圆）
-            sg_tgt_need  = NAV_HOME_NEED;
-            sg_tgt_long  = 0u;
-            sg_tgt_last  = 0u;
-            sg_cap_ticks = NAV_HOME_MAX_TICKS;
+            // 长间隔线模式：跳过斜线等短线，只认同心圆（不受起步位置/朝向影响）
+            sg_tgt_mode    = 1u;
+            sg_tgt_need    = NAV_HOME_NEED;
+            sg_tgt_min_gap = NAV_HOME_MIN_GAP;
+            sg_tgt_long    = 0u;
+            sg_tgt_last    = 0u;
+            sg_cap_ticks   = NAV_HOME_MAX_TICKS;
             Nav_Counter_Init(0);
             nav_phase = PATH_TO_HOME;
             break;
