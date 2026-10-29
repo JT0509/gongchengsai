@@ -1,5 +1,17 @@
 #include "steering.h"
 
+// ★2026-10-29 夹爪硬件改过，张开量加大（原 1980µs≈133°）。
+//   线性换算：1980→1320 共 660µs ≈59° → 约 11.2µs/°。
+//   调法：不够就按 +60µs（≈+5.4°）一档加，建议不超过 2300（再大可能顶机械限位、堵转发热）。
+//   ⚠ 张开行程变大后到位时间也略长：若上电起车时夹爪还没张到位，
+//     把 nav.h 的 NAV_SERVO_OPEN_MS 从 600 加到 700。
+//   ★2026-10-29 再张开 10°：2100 → 2210 → 2320（11.2µs/° × 10 ≈ 112µs）。
+//     ⚠ 2320 已超过之前估的 2300 软上限，正在逼近机械限位。
+//       上电后听/看夹爪：到头有"吱"的堵转声或齿条顶死抖动 → 立刻退回 2280。
+//       堵转超过几秒会烧舵机，别长时间停在最开位置。
+#define STEERING_OPEN_US   2320
+#define STEERING_CLOSE_US  1320
+
 u8 STEERING_FLAG = 0; //0:RESET 1:SET
 u16 Steering_Delay = 0;
 
@@ -36,16 +48,16 @@ void Steering_Init(void)
     TIM_Cmd(TIM9, ENABLE);
 }
 
-// 夹爪「收紧」：1.32ms ≈ 74°（收紧=夹住物料；与张开相差 59°）
+// 夹爪「收紧」：1.32ms ≈ 74°（收紧=夹住物料）
 void Steering_RESET(void)
 {
-    TIM_SetCompare1(TIM9, 1320);
+    TIM_SetCompare1(TIM9, STEERING_CLOSE_US);
 }
 
-// 夹爪「张开」：1.98ms ≈ 133°（张开=物料进出工作位）
+// 夹爪「张开」：2.10ms ≈ 144°（张开=物料进出工作位；原 1.98ms）
 void Steering_SET(void)
 {
-    TIM_SetCompare1(TIM9, 1980);
+    TIM_SetCompare1(TIM9, STEERING_OPEN_US);
 }
 
 void Engine_Working(void)

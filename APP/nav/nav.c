@@ -35,6 +35,15 @@ volatile uint8_t  DBG_NAV_HEAD_BEFORE   = 0; // 转向前的 sg_heading
 volatile uint8_t  DBG_NAV_TURN_TGT      = 0; // 本次目标角
 volatile int16_t  DBG_NAV_TURN_DEG      = 0; // 本次实际下发的带符号转角
 volatile uint16_t DBG_NAV_TURN_MS       = 0; // 本次旋转延时 ms
+// 靶位对位微调（ms @速度12，正=前进 负=后退）：Watch 里可直接改，按 KEY0 重新开局即生效，
+// 不用重编。每次开局 Nav_Task2_Start 用它覆盖 sg_place_fine_ms。
+volatile int16_t  DBG_NAV_FINE_MS       = NAV_TARGET_FINE_MS;
+// 实际用在靶位对位上的微调值（每投一次更新一次）：若它≠你设的值，说明设置没生效
+volatile int16_t  DBG_NAV_FINE_APPLIED  = 0;
+// 放料后退后时长（ms @NAV_INCH_V）：Watch 里直接改，下一次放料就用新值
+volatile int16_t  DBG_NAV_BACK_MS       = NAV_BACKOFF_MS;
+// 靶位到点反向刹车脉宽（ms @NAV_BRAKE_V）：Watch 里直接改，下一次到靶位就用新值
+volatile int16_t  DBG_NAV_BRAKE_MS      = NAV_BRAKE_MS;
 
 // 整局所有转向的流水（单变量只看得到最后一次，整局会被覆盖）
 //   d = TGT − HEAD（按最短路径归一化）；MS 是下发的旋转延时
@@ -43,6 +52,10 @@ volatile uint8_t  NAV_TURN_LOG_HEAD[NAV_TURN_LOG_N] = {0};
 volatile uint8_t  NAV_TURN_LOG_TGT[NAV_TURN_LOG_N]  = {0};
 volatile uint16_t NAV_TURN_LOG_MS[NAV_TURN_LOG_N]   = {0};
 volatile uint8_t  DBG_NAV_PLACE_REASON  = 0;
+
+// 回家段数线黑匣子（2026-10-29）：每条确认线的间隔，查「到底数了哪几条」
+volatile uint8_t  NAV_HOME_N = 0;
+volatile uint16_t NAV_HOME_GAP[6] = {0};
 
 // ==================== 黑匣子（无串口/免跟车调试） ====================
 // 车跑完停住后插 ST-Link，用 attach（不复位）读 RAM 回放现场。
@@ -136,6 +149,12 @@ static uint8_t  sg_fr_clear  = 0u;  // 连续看到线（pos>=0）的拍数
 static uint8_t  sg_fr_cnt    = 0u;  // 特征连续拍数（消抖）
 static uint8_t  sg_target_color = 0u; // 本次夹到的颜色（黑料靶特征不同）
 
+// 彩盘前缘提前触发（2026-10-29）
+//   中间区（探头3~6）沿射线一直压着黑线 → "见过黑"计数；进彩盘后中间区全白 → 计数。
+static uint8_t  sg_fr_mid_black = 0u; // 中间区见过黑的记忆窗（每拍递减）
+static uint8_t  sg_fr_edge_cnt  = 0u; // 中间区连续全白拍数
+static uint16_t sg_tgt_inner_ticks = 0u; // 非绿靶：内圆确认时的 seg_ticks（前缘距离门用）
+
 // ----------------------------------------------------------------------------
 // 三块料账本 + 车头朝向
 //   sg_heading      车头朝向，只可能是 45° 整数倍；每次转向后在格点上重新锚定
@@ -221,6 +240,19 @@ static void Nav_TrcPhase(void)
                            | ((sg_claw     != 0u) ? 0x80u : 0u));
         NAV_TRC_NUM++;
     }
+}
+
+// ★2026-10-29 靶位专用刹车：判到点后先反向给一小段速度，把滑行抵掉再停。
+//   只用于「投料到靶位」这一处停车。圆心/内圆点/转向的停车距离都是开环标定的，
+//   换刹车方式会改变这些点的实际停车位置，破坏已标好的里程门限。
+static void Nav_Stop_Brake(void)
+{
+    int16_t bm = DBG_NAV_BRAKE_MS;
+    if (bm < 0)    { bm = 0; }
+    if (bm > 400)  { bm = 400; }
+    Diff_Drive(-NAV_BRAKE_V, -NAV_BRAKE_V);
+    delay_ms((uint32_t)bm);
+    Stop_Retry(3);
 }
 
 static void Nav_StopSnap(void)
@@ -702,9 +734,11 @@ static uint8_t Nav_BackCenter_Check(void)
 // ============================================================================
 static void Nav_Front_Reset(void)
 {
-    sg_fr_armed = 0u;
-    sg_fr_clear = 0u;
-    sg_fr_cnt   = 0u;
+    sg_fr_armed     = 0u;
+    sg_fr_clear     = 0u;
+    sg_fr_cnt       = 0u;
+    sg_fr_mid_black = 0u;
+    sg_fr_edge_cnt  = 0u;
 }
 
 // 靶位特征：彩盘把黑线在中间"断开"
@@ -712,9 +746,8 @@ static void Nav_Front_Reset(void)
 //           中间区域 = 探头3~6（bit5~bit2），只要其中 ≥2 个是白就算数，
 //           不再要求"正中间两个探头一定白"——车横向偏了也能命中。
 //   黑料  ：圆盘和黑线连成一片 → 中间区域整段黑
-static uint8_t Nav_Front_Zone_Sig(void)
+static uint8_t Nav_Front_Zone_Sig(uint8_t d)
 {
-    uint8_t d   = F_GW_digital_Read();
     uint8_t mid;
     uint8_t n;
 
@@ -740,9 +773,26 @@ static uint8_t Nav_Front_Zone_Sig(void)
     return 1u;
 }
 
+// ★2026-10-29 前缘触发的「距离门」
+//   中间区全白本身也可能是丢线（横向偏出线外），所以必须车已经走到靶位附近才认。
+//   绿靶：A 出发已在内圆外，按段内绝对拍数（≈315mm，彩盘前缘 344mm）。
+//   非绿：必须已确认内圆，且内圆之后又走满一个内圆间隔（≈290mm）。
+static uint8_t Nav_Target_Edge_Armed(void)
+{
+    if (sg_tgt_mode == 0u)
+    {
+        return (Nav.seg_ticks >= NAV_TARGET_EDGE_ARM_TICKS) ? 1u : 0u;
+    }
+
+    if (sg_tgt_long < 1u || sg_gap == 0u) return 0u;
+    if (Nav.seg_ticks < sg_tgt_inner_ticks) return 0u;
+    return ((uint32_t)(Nav.seg_ticks - sg_tgt_inner_ticks) >= (uint32_t)sg_gap) ? 1u : 0u;
+}
+
 static uint8_t Nav_Target_Front_Check(void)
 {
     int16_t pos = F_GW_position();
+    uint8_t d   = F_GW_digital_Read();
 
     // ★门 1（硬性）：夹着料才允许认靶位。
     //   DBG_NAV_SERVO 就是舵机状态、也就是"有没有料"的状态：
@@ -780,7 +830,37 @@ static uint8_t Nav_Target_Front_Check(void)
         return 0u;
     }
 
-    if (Nav_Front_Zone_Sig())
+    // ★彩盘前缘提前触发（2026-10-29，治「送料过冲 31mm」）
+    //   沿射线走时中间区（探头3~6）一直压着辐射线 → 有黑；
+    //   进 Ø92 彩盘后中间区全白 → 在「压到大圆黑线」之前 ≈43mm 就判到点。
+    //   黑料靶不走这条：黑盘和黑线分不开，仍用下面的老判据。
+    if (sg_target_color != (uint8_t)TCS3200_COLOR_BLACK)
+    {
+        if ((d & NAV_FR_MID_WHITE) != 0u)
+        {
+            sg_fr_mid_black = NAV_TARGET_EDGE_BLACK_MEM; // 中间区还压着线
+            sg_fr_edge_cnt  = 0u;
+        }
+        else if (sg_fr_mid_black > 0u)
+        {
+            sg_fr_mid_black--;
+            if (sg_fr_edge_cnt < 0xFFu) sg_fr_edge_cnt++;
+
+            if (sg_fr_edge_cnt >= NAV_TARGET_EDGE_K && Nav_Target_Edge_Armed())
+            {
+                sg_fr_edge_cnt  = 0u;
+                sg_fr_mid_black = 0u;
+                return 2u; // 2=彩盘前缘（提前≈43mm），1=老判据（压线）
+            }
+        }
+        else
+        {
+            // 记忆窗过期：已经很久没压到线（多半是丢线），中间全白不算靶位
+            sg_fr_edge_cnt = 0u;
+        }
+    }
+
+    if (Nav_Front_Zone_Sig(d))
     {
         if (sg_fr_cnt < 0xFFu) sg_fr_cnt++;
         if (sg_fr_cnt >= NAV_TARGET_BLACK_K)
@@ -800,20 +880,52 @@ static uint8_t Nav_Target_Front_Check(void)
 
 static uint8_t Nav_Target_Check(void)
 {
+    uint8_t home = (nav_phase == PATH_TO_HOME) ? 1u : 0u;
+
     if (sg_line_count == 0u) return 0u;
     if (sg_line_count == sg_tgt_last) return 0u; // 没有新线
     sg_tgt_last = sg_line_count;
 
+    // 回家段黑匣子：每条确认线都记间隔（含被门限滤掉的短线）
+    if (home && NAV_HOME_N < 6u)
+    {
+        NAV_HOME_GAP[NAV_HOME_N] = sg_gap;
+        NAV_HOME_N++;
+    }
+
     if (sg_tgt_mode && sg_gap < sg_tgt_min_gap) return 0u; // 短间隔线不算
+
+    // ★回家段第 1 条长线组合门（2026-10-29）
+    //   起点若停在圆心前，第一条斜线的间隔会被拉大，可能超过 117 的门限被误认成长线，
+    //   于是「内圆=2、出发圆=3」在出发圆就停（早 150mm）。
+    //   斜线和真内圆的区别：斜线 gap 和 seg_ticks **同时小**；内圆 gap ≈258 拍。
+    if (home && sg_tgt_long == 0u &&
+        sg_gap < NAV_HOME_FIRST_MIN_GAP &&
+        Nav.seg_ticks < NAV_HOME_FIRST_MIN_TICKS)
+    {
+        return 0u;
+    }
 
     sg_tgt_long++;
 
     // 内圆（第 1 条长线）之后重算上限：剩 396mm，用刚测的 277mm 间隔换算×2
+    //   ⚠ 只用于靶位段。回家段的兜底必须保持 NAV_HOME_MAX_TICKS，
+    //     否则漏线时上限会被放大到 ≈970~1100mm，冲出出发区。
     if (sg_tgt_mode && sg_tgt_long == 1u && sg_gap > 0u)
     {
-        sg_cap_ticks = (uint32_t)Nav.seg_ticks + (uint32_t)sg_gap * 2u;
-        if (sg_cap_ticks > 60000u) sg_cap_ticks = 60000u;
-        DBG_NAV_CAP = (uint16_t)sg_cap_ticks;
+        sg_tgt_inner_ticks = Nav.seg_ticks; // 前缘触发的距离门基准点
+        if (nav_phase == PATH_TO_TARGET)
+        {
+            sg_cap_ticks = (uint32_t)Nav.seg_ticks + (uint32_t)sg_gap * 2u;
+            if (sg_cap_ticks > 60000u) sg_cap_ticks = 60000u;
+            DBG_NAV_CAP = (uint16_t)sg_cap_ticks;
+        }
+    }
+
+    // ★回家段总数门：第 3 条线（大圆）必须走够 ≈697mm，否则肯定是多数了一条
+    if (home && sg_tgt_long >= sg_tgt_need && Nav.seg_ticks < NAV_HOME_MIN_TOTAL_TICKS)
+    {
+        return 0u;
     }
 
     return (sg_tgt_long >= sg_tgt_need) ? 1u : 0u;
@@ -867,6 +979,8 @@ void Nav_Init(void)
     sg_tgt_min_gap  = NAV_TARGET_MIN_GAP;
     sg_tgt_long     = 0u;
     sg_tgt_last     = 0u;
+    sg_tgt_inner_ticks = 0u;
+    NAV_HOME_N         = 0u;
 
     NAV_STOP_SNAPPED = 0;
     NAV_STOP_POS     = 0;
@@ -910,6 +1024,8 @@ void Nav_Task2_Start(void)
     sg_tgt_min_gap  = NAV_TARGET_MIN_GAP;
     sg_tgt_long     = 0u;
     sg_tgt_last     = 0u;
+    sg_tgt_inner_ticks = 0u;
+    NAV_HOME_N         = 0u;
 
     // 账本清零
     sg_heading       = 90u;            // 出发朝北
@@ -923,7 +1039,7 @@ void Nav_Task2_Start(void)
     sg_retrieve      = 0u;
     sg_stage_slot    = 0xFFu;
     sg_pick_angle    = 90u;            // 第一块先取 C（正前方，不用转）
-    sg_place_fine_ms = NAV_TARGET_FINE_MS;
+    sg_place_fine_ms = DBG_NAV_FINE_MS;   // Watch 可改，重开局生效
 
     sg_cap_ticks = NAV_CENTER_MAX_TICKS; // 兜底上限，数到第 2 条线后自动重算
 
@@ -1089,6 +1205,9 @@ void Nav_Task2_Run(void)
                 // 不回圆心、不转向，省 780mm 和一次转向误差。沿途只有大圆一条线。
                 sg_tgt_mode  = 0u;
                 sg_tgt_need  = 1u;
+                sg_tgt_long  = 0u;              // 必须清：残留值会让第一条线被 sg_tgt_last 吞掉
+                sg_tgt_last  = 0u;
+                sg_tgt_inner_ticks = 0u;
                 sg_cap_ticks = NAV_TARGET_GREEN_MAX_TICKS;
                 Nav_Front_Reset();
                 Nav_Counter_Init(0); // 脚下是内圆线，跳过
@@ -1162,6 +1281,7 @@ void Nav_Task2_Run(void)
             sg_tgt_min_gap = NAV_TARGET_MIN_GAP;
             sg_tgt_long    = 0u;
             sg_tgt_last    = 0u;
+            sg_tgt_inner_ticks = 0u;
             sg_cap_ticks   = NAV_TARGET_MAX_TICKS;
             Nav_Front_Reset();
             Nav_Counter_Init(0); // 圆心黑芯/射线上，等白了再数
@@ -1174,16 +1294,19 @@ void Nav_Task2_Run(void)
         case PATH_TO_TARGET:
         {
             uint8_t hit = 0u;
+            uint8_t fr;
 
             Nav_Update();
             Trace_Forward();
             DBG_NAV_POS = DBG_pos;
 
-            // 主判据：前灰度靶位特征（离料近，不会把料送出靶心）
+            // 主判据：前灰度靶位（离料近，不会把料送出靶心）
+            //   返回 2=彩盘前缘（新，提前≈43mm）  1=压到大圆黑线（老判据，黑料靶走这条）
             // 兜底：侧灰度长间隔线（前灰度万一没识别到，退回老判据，宁可偏外也别冲过）
-            if (Nav_Target_Front_Check())
+            fr = Nav_Target_Front_Check();
+            if (fr)
             {
-                DBG_NAV_PLACE_REASON = 1; // 前灰度特征
+                DBG_NAV_PLACE_REASON = (fr == 2u) ? 3u : 1u;
                 hit = 1u;
             }
             else if (Nav_Target_Check())
@@ -1194,7 +1317,7 @@ void Nav_Task2_Run(void)
 
             if (hit)
             {
-                Stop();
+                Nav_Stop_Brake();   // ★靶位专用：先反向点一下刹住，抵消滑行
                 Nav_StopSnap();
                 nav_phase = PATH_PLACE;
             }
@@ -1221,16 +1344,21 @@ void Nav_Task2_Run(void)
             delay_ms(200);
 
             // 对位微调：正=前进、负=后退
-            //   投靶位用 NAV_TARGET_FINE_MS（实测料冲过靶心 31mm → 取负）
+            //   投靶位用 DBG_NAV_FINE_MS（料冲过靶心 → 取负）
             //   暂存点用 NAV_STORE_FINE_MS（一般 0）
+            //   ★速度用 NAV_FINE_V（不是 NAV_INCH_V）：速度 8 太慢，4 轮滑移底盘
+            //     起步要克服静摩擦，实测基本看不到位移 → 微调形同失效。
+            //   ★★这段在 Steering_SET() 之前，"退后再放"就是靠它。
+            //     张开之后再退（下面第二步）只抽夹爪，改变不了料已经落下的位置。
+            DBG_NAV_FINE_APPLIED = sg_place_fine_ms; // 留档：实际用到的是多少
             if (sg_place_fine_ms > 0)
             {
-                Diff_Drive(NAV_INCH_V, NAV_INCH_V);
+                Diff_Drive(NAV_FINE_V, NAV_FINE_V);
                 delay_ms((uint32_t)sg_place_fine_ms);
             }
             else if (sg_place_fine_ms < 0)
             {
-                Diff_Drive(-NAV_INCH_V, -NAV_INCH_V);
+                Diff_Drive(-NAV_FINE_V, -NAV_FINE_V);
                 delay_ms((uint32_t)(-sg_place_fine_ms));
             }
             Stop_Retry(3);
@@ -1239,9 +1367,15 @@ void Nav_Task2_Run(void)
             DBG_NAV_SERVO = 0;
             delay_ms(NAV_RELEASE_MS);
 
-            Diff_Drive(-NAV_INCH_V, -NAV_INCH_V); // 退后脱离物料
-            delay_ms(NAV_BACKOFF_MS);
-            Stop_Retry(3);
+            // 退后脱离物料：Watch 里改 DBG_NAV_BACK_MS 可现场加长，下一次放料即生效
+            {
+                int16_t bo = DBG_NAV_BACK_MS;
+                if (bo < 0)    { bo = 0; }
+                if (bo > 1500) { bo = 1500; }
+                Diff_Drive(-NAV_INCH_V, -NAV_INCH_V);
+                delay_ms((uint32_t)bo);
+                Stop_Retry(3);
+            }
 
             // 记账
             if (staged)
@@ -1250,7 +1384,7 @@ void Nav_Task2_Run(void)
                 sg_stage_slot = 0xFFu;
             }
             sg_claw          = 0u;
-            sg_place_fine_ms = NAV_TARGET_FINE_MS;
+            sg_place_fine_ms = DBG_NAV_FINE_MS;   // Watch 可改，重开局生效
 
             // 回圆心：从内圆点（暂存）退 390mm，从大圆（靶位）退 780mm
             sg_tgt_long  = 0u;
@@ -1304,7 +1438,7 @@ void Nav_Task2_Run(void)
                     // 可投 → 去靶位
                     sg_stage_slot    = 0xFFu;
                     sg_target_angle  = t;
-                    sg_place_fine_ms = NAV_TARGET_FINE_MS;
+                    sg_place_fine_ms = DBG_NAV_FINE_MS;   // Watch 可改，重开局生效
                     nav_phase        = PATH_TURN_TO_TARGET;
                 }
             }
@@ -1357,7 +1491,9 @@ void Nav_Task2_Run(void)
             sg_tgt_min_gap = NAV_HOME_MIN_GAP;
             sg_tgt_long    = 0u;
             sg_tgt_last    = 0u;
+            sg_tgt_inner_ticks = 0u;
             sg_cap_ticks   = NAV_HOME_MAX_TICKS;
+            NAV_HOME_N     = 0u; // 回家段数线黑匣子清零
             Nav_Counter_Init(0);
             nav_phase = PATH_TO_HOME;
             break;

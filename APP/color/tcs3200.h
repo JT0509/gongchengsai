@@ -123,12 +123,14 @@
    0 = 允许 KEY0 / TCS3200_CalibrateWhite() 现场标定（调试用） */
 #define TCS3200_USE_FIXED_WHITE_REF 1
 
-/* 2026-10-24 实测：100% 档 + 50ms 闸门，白纸距离 1~2cm，
-   RAW R/G/B = 1715 / 1776 / 2030，Clear = 5186。
-   改场地/灯光/距离后需要重新测一组替换这里。 */
-#define TCS3200_FIXED_REF_R 1715u
-#define TCS3200_FIXED_REF_G 1776u
-#define TCS3200_FIXED_REF_B 2030u
+/* ★2026-10-29 重标：夹爪结构改动后模块离料更近，白纸 RAW 从 1715 涨到 6747（3.9 倍）。
+   旧参考偏小 → 所有通道归一化后被削顶到 255 → 绿料饱和度塌到 16%（判成白）、
+   黑料被放大到 108（掉进 45~150 灰区判 UNKNOWN）。按新几何实测白料 RAW 重设：
+     R/G/B = 6747 / 6994 / 8096（车上夹持位实测）
+   判色只用 R/G/B，Clear 不参与，保持旧值不影响结果。 */
+#define TCS3200_FIXED_REF_R 6747u
+#define TCS3200_FIXED_REF_G 6994u
+#define TCS3200_FIXED_REF_B 8096u
 #define TCS3200_FIXED_REF_C 5186u
 
 /* ------------------------------- 类型定义 ---------------------------------- */
@@ -229,5 +231,23 @@ const char *TCS3200_ColorName(TCS3200_Color_t color);
 
 /* 调试：打印 RAW R/G/B/C、归一化 RGB 与颜色名（走 printf -> USART1） */
 void TCS3200_DebugPrint(void);
+
+/* ============================================================================
+ * 颜色标定模式（本车无串口，改用 Watch 读）
+ *   调用一次 = 采样一次（4 个滤光片 × 50ms ≈ 220ms），把结果写进下面这些 volatile 变量。
+ *   与 TCS3200_ReadColor() 不同：这里**不丢 UNKNOWN**，判定结果原样给出，
+ *   用于看清「料被判成什么、为什么被判成这个」。
+ * ========================================================================== */
+extern volatile uint8_t  DBG_COLOR_ID;      /* 本次判定：0 NONE 1 白 2 黑 3 红 4 绿 5 蓝 9 UNKNOWN */
+extern volatile uint8_t  DBG_COLOR_R;       /* 归一化 R（0~255，白纸参考下白=255） */
+extern volatile uint8_t  DBG_COLOR_G;
+extern volatile uint8_t  DBG_COLOR_B;
+extern volatile uint32_t DBG_COLOR_RAW_R;   /* 原始脉冲数（白纸基准 1715/1776/2030/5186） */
+extern volatile uint32_t DBG_COLOR_RAW_G;
+extern volatile uint32_t DBG_COLOR_RAW_B;
+extern volatile uint32_t DBG_COLOR_RAW_C;
+extern volatile uint16_t DBG_COLOR_N;       /* 采样次数，在涨 = 程序活着 */
+
+void TCS3200_CalibSample(void);
 
 #endif

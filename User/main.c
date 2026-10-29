@@ -710,6 +710,52 @@ static void Turn_Calib_Test(void)
     }
 }
 
+/* ============================================================================
+ * 颜色标定（不跑导航）
+ *   KEY1：夹爪夹紧 → 连续采样，Watch 里看实车归一化 RGB 与判定
+ *   KEY0：夹爪张开，换下一块料
+ * 采样间隔 ≈220ms（4 个滤光片 × (50+5)ms），所以按键要按住约半秒。
+ *
+ * Watch 加这几个（全部 volatile，定义在 tcs3200.c）：
+ *   DBG_COLOR_R / _G / _B        归一化 RGB（白纸参考下白=255）
+ *   DBG_COLOR_RAW_R/_G/_B/_C     原始脉冲数（基准 1715/1776/2030/5186）
+ *   DBG_COLOR_ID                 本次判定：0 NONE 1 白 2 黑 3 红 4 绿 5 蓝 9 UNKNOWN
+ *   DBG_COLOR_N                  采样次数（在涨 = 程序活着）
+ *
+ * 用法：夹好一块料 → ID 稳定后记下 RGB → 换下一个颜色 → 五色记完比对。
+ *   ★与跑车时的差别：这里 UNKNOWN 也直接显示（跑车时它会被丢弃→读色失败）。
+ * ========================================================================== */
+static void Color_Calib_Test(void)
+{
+    uint8_t k0_cnt = 0, k0_stable = 0;
+    uint8_t k1_cnt = 0, k1_stable = 0;
+    uint8_t sampling = 0u;
+
+    Stop();
+    Steering_SET();          // 上电先张开
+    delay_ms(500);
+
+    while (1) {
+        if (Enc_Key_Debounce(KEY1_DOWN(), &k1_cnt, &k1_stable)) {
+            Steering_RESET(); // 夹紧
+            delay_ms(1000);   // 与跑车一致：300ms 停稳 + 700ms 夹爪到位
+            sampling = 1u;
+        }
+
+        if (Enc_Key_Debounce(KEY0_DOWN(), &k0_cnt, &k0_stable)) {
+            sampling = 0u;
+            Steering_SET();   // 张开，换料
+            delay_ms(300);
+        }
+
+        if (sampling) {
+            TCS3200_CalibSample();
+        } else {
+            delay_ms(20);
+        }
+    }
+}
+
 int main()
 {
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
@@ -737,6 +783,9 @@ int main()
     /* ==================== 模式入口：同时只放开一行 ==================== */
     // 当前：第一题整局（KEY0 启动 / KEY1 急停）
     Nav_Task2_Test();
+
+    // 颜色标定（KEY1 夹紧并连续读色 / KEY0 张开换料）——重标白平衡后用
+    //   Color_Calib_Test();
 
     // 开环标定：KEY0 转 DBG_TURN_DEG 度 / KEY1 直线 5s、8s 量速度
     //   标定转向：DBG_TURN_DEG=180、DBG_TURN_MS_OVERRIDE=1900，按 KEY0 看转多少度

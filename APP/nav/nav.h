@@ -110,7 +110,7 @@
 //   标定条件和实跑条件不一致，标出来的 RATE 搬过去必然偏。
 //   加长到 600ms 后，实跑条件 ≈ 标定条件（都从完全静止起步）。
 //   ⚠ 改这个值之后必须重新标 RATE，否则标定值对不上。
-#define NAV_TURN_SETTLE_MS    600
+#define NAV_TURN_SETTLE_MS    450   // ★2026-10-29 600→450（减少停顿；仍远长于停车滑行时间）
 #define NAV_TURN_T0_MS        110   // ★350→50→110。实跑 180° 偏大（90° 能靠循迹找回、
                                    //   180° 找不回），整体缩一档：RATE 10→11 把斜率抬起来，
                                    //   小角度那段用 T0 补回来，避免 45° 转少了。
@@ -141,9 +141,19 @@
 #define NAV_CLAMP_SETTLE_MS 700  // 夹紧后等夹爪完全到位再读色（≥舵机全行程 600ms + 余量）
 #define NAV_COLOR_SAMPLES   3    // ReadColorStable 投票次数（≈660ms）
 #define NAV_COLOR_RETRY     2    // 读不到时原地重读次数，仍失败则 ABORT
-#define NAV_INCH_V          8    // 微进/退后的低速（速度寄存器）
-#define NAV_RELEASE_MS      300  // 张开后等料落稳，再退
-#define NAV_BACKOFF_MS      500  // 放完料退后 ≈20mm，让夹爪脱离物料
+#define NAV_INCH_V          12   // 张开后"退后脱离物料"用的速度。原来 8，实测
+                                 //   低于滑移底盘起步门限 → 350ms 几乎不动，肉眼看不出后退。
+#define NAV_FINE_V          12   // ★靶位对位微调用的速度。原来借用速度 8，
+                                 //   实测太慢：4 轮滑移底盘静摩擦大，几百毫秒几乎不动。
+                                 //   12 ≈ 0.065mm/ms（按 18 速 96.8mm/s 线性折算，实际略小）
+#define NAV_BRAKE_V         10   // 靶位到点时的反向刹车速度（正=前进，取负=后退）
+#define NAV_BRAKE_MS        120  // 反向刹车脉宽：先反向点一下再 Stop_Retry
+#define NAV_RELEASE_MS      200  // 张开后等料落稳，再退（原 300）
+#define NAV_BACKOFF_MS      200  // 张开后退后：只负责把夹爪从料上抽走（≈13mm）
+                                 //   ★不影响落点（料在张开瞬间已脱手）。
+                                 //   这个量越大，回程起点越靠后，越可能把身后那条
+                                 //   大圆线重新压回去 → 数多一条线。有异常先调 0。
+                                 //   现场用 DBG_NAV_BACK_MS 在 Watch 里直接改，无需重编译
 
 //   回圆心（A→圆心倒退 390mm，后灰度 PD）
 //   签名：最后两条线（斜线 → 主辐射线）间隔骤减，复用圆心判据
@@ -189,6 +199,19 @@
 #define NAV_TARGET_ARM_TICKS 20  // 30×0.6
 #define NAV_TARGET_BLACK_K   2
 
+//   ★2026-10-29 彩盘前缘提前触发（治「送料略微过冲」）
+//   老判据要「两侧黑」，必须等阵列压到大圆黑线才成立；而料在阵列前方 31mm，
+//   所以一触发就已经过冲 ≈31mm（开发记录 §20）。彩盘 Ø92，中间 4 个探头跨 ≈33mm：
+//   车到盘心前 √(46²−16.5²)≈43mm 时中间区就被彩盘盖满 → 比「压线」早 ≈43mm，
+//   料从「过冲 31mm」变成「欠 12mm」，扣消抖+滑行后基本落在靶心。
+//   物理依据：沿射线走时中间区一直压着辐射线（必然有黑），只有进彩盘才全白。
+//   黑料靶不适用（黑盘与黑线分不开），仍走老判据。
+#define NAV_TARGET_EDGE_K         2    // 中间区全白连续拍数（消抖）
+#define NAV_TARGET_EDGE_BLACK_MEM 15   // 中间区「见过黑」的记忆窗（拍），防丢线时全白误触发
+#define NAV_TARGET_EDGE_ARM_TICKS 280  // 绿靶：段内走满这么多拍才允许前缘触发
+                                       // （≈315mm；彩盘前缘在 344mm≈306 拍，留 26 拍余量）
+                                       // 非绿靶：内圆之后又走满一个内圆间隔（sg_gap≈258 拍≈290mm）
+
 //   前灰度字节位定义（黑=1、白=0；探头1=bit7 … 探头8=bit0）
 //   判据放宽：不要求"正中间两个探头白"，只要
 //     ① 中间区域（探头3~6）至少 2 个是白 —— 车偏了也能命中
@@ -199,12 +222,16 @@
 #define NAV_FR_RIGHT_BLACK  0x03u // 探头7~8 至少一个黑
 #define NAV_FR_MID_MIN_WHITE 2u   // 中间区域至少几个白才算命中（1=更松，3=更严）
 
-//   到点后的对位微调（实车标定）：正=前进、负=后退，单位 ms @速度 8（≈41mm/s）
-//   料落在靶心外侧就往负调，落在内侧就往正调。默认 0，先跑一趟再定。
+//   到点后的对位微调（实车标定）：正=前进、负=后退，单位 ms @速度 12（≈65mm/s）
+//   料落在靶心外侧就往负调，落在内侧就往正调。
 //   ★ 实测：前灰度阵列到物料圆心 ≈31mm，夹具在车头前方 → 料在阵列前方，
 //     触发瞬间料已冲出靶心 31mm → 补偿量取【负】。
-//     33mm ≈ -800ms 起步（速度 8 的 mm/s 未实测，最终以量落点为准）。
-#define NAV_TARGET_FINE_MS   0
+//   ★2026-10-29 这条就是"退后再开夹爪"的那个后退，默认给足一档：
+//     -450 实测已明显改善，但仍差 1~1.5cm → 再加 200ms（≈13mm）→ -650。
+//     （按 450ms ≈ 29mm 的实测比例折算：1cm ≈ 154ms）
+//     注意它发生在 Steering_SET() 之前 —— 只有这之前的后退才能改变料的落点；
+//     张开之后那次后退（NAV_BACKOFF_MS）只负责把夹爪从料上抽走，不影响落点。
+#define NAV_TARGET_FINE_MS  (-650)
 #define NAV_STORE_FINE_MS    0    // 暂存点（B/D 内圆）放料的微调，一般 0
 
 // ----------------------------------------------------------------------------
@@ -224,7 +251,21 @@
 #define NAV_HOME_ANGLE        270
 #define NAV_HOME_NEED         3    // 长间隔线：内圆、出发圆、大圆
 #define NAV_HOME_MIN_GAP      117  // 126mm：> 斜线81拍、< 大圆段124拍，两侧各留 ≈20%
-#define NAV_HOME_MAX_TICKS    2600
+
+//   ★2026-10-29 回家防数错（@18 速、拍距 1.124mm/拍）
+//   根因：回家起点是圆心，倒退停车有 ±d 余量。若停在圆心前 50mm，第一条斜线
+//   距离变成 150mm≈133 拍 > NAV_HOME_MIN_GAP=117 → 被误认成第 1 条长线，
+//   于是「内圆=2、出发圆=3」→ 在出发圆就停，比大圆早 150mm（回不到起点）。
+//   本段里程：内圆 390mm(347拍) → 出发圆 628mm(559拍) → 大圆 780mm(694拍+爬坡≈700)
+#define NAV_HOME_FIRST_MIN_TICKS 280  // 第 1 条长线：间隔和总拍数都小的才丢弃（组合门）
+                                      // 正常：斜线 gap≈89 拍/seg≈89 拍，两个都小 → 丢弃
+                                      //       内圆 gap≈258 拍 → 只这一个就够，保留
+                                      // 起点偏前 100mm：斜线 gap≈178/seg≈178 → 丢弃；内圆 gap≈258 → 保留
+#define NAV_HOME_FIRST_MIN_GAP   200  // 与上面组合使用：gap<200 且 seg<280 才丢
+#define NAV_HOME_MIN_TOTAL_TICKS 620  // 第 3 条线（大圆）必须 ≥ 此拍数（≈697mm）
+                                      // 出发圆 559 拍 < 620 < 大圆 ≈700 拍
+#define NAV_HOME_MAX_TICKS    800     // 兜底 ≈900mm（原 2600，会冲出场地）
+                                      // 仍在出发区 Ø320 内（R≤940）；漏线时也保返回分
 
 // 从大圆（靶位）倒退回圆心：780mm，车速降到 30mm/s 时约 2260 拍
 #define NAV_BACK_BIG_MAX_TICKS 2600
@@ -236,8 +277,9 @@
 //   NAV_SERVO_OPEN_MS  出发前等夹爪张开到位（不等的话夹爪还在摆车就冲出去了）
 //   NAV_CLAMP_DELAY_MS A 点停车后先停稳再夹（避免车还在滑、物料相对夹爪还在动）
 // ----------------------------------------------------------------------------
-#define NAV_SERVO_OPEN_MS  600
-#define NAV_CLAMP_DELAY_MS 300
+#define NAV_SERVO_OPEN_MS  700   // ★2026-10-29 600→700：张开量又加了 10°，
+                                 //   舵机全行程 59°≈600ms，多 10° 约多 100ms
+#define NAV_CLAMP_DELAY_MS 200   // ★2026-10-29 300→200（减少停顿）
 
 // ==================== 导航状态（Cortex-Debug Watch 可直接看 Nav） ====================
 typedef struct
@@ -295,6 +337,15 @@ extern volatile uint8_t  DBG_NAV_HEAD_BEFORE;   // 转向前 sg_heading
 extern volatile uint8_t  DBG_NAV_TURN_TGT;      // 目标角
 extern volatile int16_t  DBG_NAV_TURN_DEG;      // 实际下发转角（带符号，+=右转）
 extern volatile uint16_t DBG_NAV_TURN_MS;       // 旋转延时 ms
+extern volatile int16_t  DBG_NAV_FINE_MS;       // 靶位对位微调（ms@NAV_FINE_V，正=前进 负=后退）
+                                                //   ★Watch 里直接改，按 KEY0 重新开局即生效
+extern volatile int16_t  DBG_NAV_FINE_APPLIED;  // 实际生效值（≠ DBG_NAV_FINE_MS 说明没设进去）
+extern volatile int16_t  DBG_NAV_BACK_MS;       // 放料后退后时长（ms@NAV_INCH_V，正=后退）
+                                                //   ★Watch 里直接改，下一次放料即生效，不用重开局
+                                                //   目标目视后退 2~3cm：约 310~460ms
+extern volatile int16_t  DBG_NAV_BRAKE_MS;      // 靶位到点反向刹车脉宽（ms@NAV_BRAKE_V，限 0~400）
+                                                //   ★Watch 里直接改，下一次到靶位即生效
+                                                //   不够灵敏（还冲过）→ 加大；刹过头（提前停）→ 减小
 // 整局转向流水：按顺序记录每次转向，d = TGT − HEAD（最短路径）
 //   Watch 里看 NAV_TURN_LOG_NUM，再展开三个数组逐个核对
 //   MS 核对：45°→447、90°→545、135°→643、180°→741
@@ -303,7 +354,12 @@ extern volatile uint8_t  NAV_TURN_LOG_NUM;
 extern volatile uint8_t  NAV_TURN_LOG_HEAD[NAV_TURN_LOG_N];
 extern volatile uint8_t  NAV_TURN_LOG_TGT[NAV_TURN_LOG_N];
 extern volatile uint16_t NAV_TURN_LOG_MS[NAV_TURN_LOG_N];
-extern volatile uint8_t  DBG_NAV_PLACE_REASON;  // 投料停因：1=前灰度特征 2=侧灰度兜底 9=拍数上限
+extern volatile uint8_t  DBG_NAV_PLACE_REASON;  // 投料停因：1=前灰度压线(老判据) 2=侧灰度兜底
+                                                //            3=彩盘前缘(新) 9=拍数上限
+// 回家段黑匣子：把每一条确认线的间隔记下来，跑完 attach 看 NAV_HOME_GAP[0..NAV_HOME_N-1]
+//   正常（从圆心起步）：≈89(斜线,不算长线) → 258(内圆) → 212(出发圆) → 135(大圆)
+extern volatile uint8_t  NAV_HOME_N;
+extern volatile uint16_t NAV_HOME_GAP[6];
 
 // ==================== 黑匣子（attach 读 RAM 回放） ====================
 // 每拍环形记录最近 NAV_LOG_N 拍；停车瞬间锁存 NAV_STOP_* 快照。

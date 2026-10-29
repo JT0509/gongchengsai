@@ -485,6 +485,42 @@ TCS3200_Color_t TCS3200_ReadColorStable(uint8_t samples)
     return (best_count == 0u) ? TCS3200_COLOR_NONE : (TCS3200_Color_t)best_index;
 }
 
+/* ---------------------- 颜色标定模式（Watch 读值用） ---------------------- */
+
+volatile uint8_t  DBG_COLOR_ID    = 0;
+volatile uint8_t  DBG_COLOR_R     = 0;
+volatile uint8_t  DBG_COLOR_G     = 0;
+volatile uint8_t  DBG_COLOR_B     = 0;
+volatile uint32_t DBG_COLOR_RAW_R = 0;
+volatile uint32_t DBG_COLOR_RAW_G = 0;
+volatile uint32_t DBG_COLOR_RAW_B = 0;
+volatile uint32_t DBG_COLOR_RAW_C = 0;
+volatile uint16_t DBG_COLOR_N     = 0;
+
+/* 采样一次并留档。★与跑车时不同：UNKNOWN(9) 也原样写出来，方便看黑料到底落在哪。 */
+void TCS3200_CalibSample(void)
+{
+    TCS3200_Raw_t   raw;
+    TCS3200_RGB_t   rgb;
+    TCS3200_Color_t c;
+
+    TCS3200_ReadRaw(&raw, TCS3200_GATE_MS);
+    TCS3200_RawToRGB(&raw, &rgb);
+    c = TCS3200_Classify(&rgb);
+
+    DBG_COLOR_RAW_R = raw.R;
+    DBG_COLOR_RAW_G = raw.G;
+    DBG_COLOR_RAW_B = raw.B;
+    DBG_COLOR_RAW_C = raw.Clear;
+
+    DBG_COLOR_R = rgb.R;
+    DBG_COLOR_G = rgb.G;
+    DBG_COLOR_B = rgb.B;
+
+    DBG_COLOR_ID = (uint8_t)c;
+    DBG_COLOR_N++;
+}
+
 const char *TCS3200_ColorName(TCS3200_Color_t color)
 {
     switch (color) {
